@@ -1,0 +1,154 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <omp.h>
+
+#define N 2000    // Tamanho da grade
+#define T 500     // Número de iterações no tempo
+#define D 0.1     // Coeficiente de difusão
+#define DELTA_T 0.01
+#define DELTA_X 1.0
+
+void diff_eq(double **C, double **C_new) {
+    for (int t = 0; t < T; t++) {
+        double difmedio = 0.;
+        
+        #pragma omp parallel for collapse(2) reduction(+:difmedio)
+        for (int i = 1; i < N - 1; i++) {
+            for (int j = 1; j < N - 1; j++) {
+                C_new[i][j] = C[i][j] + D * DELTA_T * (
+                    (C[i+1][j] + C[i-1][j] + C[i][j+1] + C[i][j-1] - 4 * C[i][j]) / (DELTA_X * DELTA_X)
+                );
+                
+                // Calcular diferença média
+                difmedio += fabs(C_new[i][j] - C[i][j]);
+            }
+        }
+        
+        // Atualizar matriz para a próxima iteração
+        #pragma omp parallel for collapse(2)
+        for (int i = 1; i < N - 1; i++) {
+            for (int j = 1; j < N - 1; j++) {
+                C[i][j] = C_new[i][j];
+            }
+        }
+        
+        // Imprimir diferença a cada 100 iterações
+        if ((t % 100) == 0) {
+            printf("interacao %d - diferenca=%g\n", t, difmedio / ((N-2)*(N-2)));
+        }
+    }
+}
+
+void diff_eq_sequential(double **C, double **C_new) {
+    for (int t = 0; t < T; t++) {
+        double difmedio = 0.;
+        
+        for (int i = 1; i < N - 1; i++) {
+            for (int j = 1; j < N - 1; j++) {
+                C_new[i][j] = C[i][j] + D * DELTA_T * (
+                    (C[i+1][j] + C[i-1][j] + C[i][j+1] + C[i][j-1] - 4 * C[i][j]) / (DELTA_X * DELTA_X)
+                );
+                
+                // Calcular diferença média
+                difmedio += fabs(C_new[i][j] - C[i][j]);
+            }
+        }
+        
+        // Atualizar matriz para a próxima iteração
+        for (int i = 1; i < N - 1; i++) {
+            for (int j = 1; j < N - 1; j++) {
+                C[i][j] = C_new[i][j];
+            }
+        }
+    }
+}
+
+double verify_results(double **C1, double **C2) {
+    double max_diff = 0.0;
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            double diff = fabs(C1[i][j] - C2[i][j]);
+            if (diff > max_diff) max_diff = diff;
+        }
+    }
+    return max_diff;
+}
+
+int main() {
+    // Testar com diferentes números de threads
+    int thread_counts[] = {1, 2, 4, 8, 16};
+    int num_tests = sizeof(thread_counts) / sizeof(thread_counts[0]);
+    
+    printf("Tamanho da grade: %d x %d\n", N, N);
+    printf("Número de iterações: %d\n\n", T);
+    printf("Threads\tTempo Sequencial\tTempo Paralelo\tSpeedup\tPrecisão\n");
+    
+    for (int test = 0; test < num_tests; test++) {
+        int num_threads = thread_counts[test];
+        omp_set_num_threads(num_threads);
+        
+        // Alocação de memória para matrizes sequenciais
+        double **C_seq = (double **)malloc(N * sizeof(double *));
+        double **C_new_seq = (double **)malloc(N * sizeof(double *));
+        
+        for (int i = 0; i < N; i++) {
+            C_seq[i] = (double *)malloc(N * sizeof(double));
+            C_new_seq[i] = (double *)malloc(N * sizeof(double));
+            
+            for (int j = 0; j < N; j++) {
+                C_seq[i][j] = 0.0;
+                C_new_seq[i][j] = 0.0;
+            }
+        }
+        C_seq[N/2][N/2] = 1.0;
+        
+        double **C_par = (double **)malloc(N * sizeof(double *));
+        double **C_new_par = (double **)malloc(N * sizeof(double *));
+        
+        for (int i = 0; i < N; i++) {
+            C_par[i] = (double *)malloc(N * sizeof(double));
+            C_new_par[i] = (double *)malloc(N * sizeof(double));
+            
+            for (int j = 0; j < N; j++) {
+                C_par[i][j] = 0.0;
+                C_new_par[i][j] = 0.0;
+            }
+        }
+        C_par[N/2][N/2] = 1.0;
+        
+        //teste sequencial
+        double start_time = omp_get_wtime();
+        diff_eq_sequential(C_seq, C_new_seq);
+        double sequential_time = omp_get_wtime() - start_time;
+        
+        //teste paralelo
+        start_time = omp_get_wtime();
+        diff_eq(C_par, C_new_par);
+        double parallel_time = omp_get_wtime() - start_time;
+        
+        //verificar precisão
+        double precision = verify_results(C_seq, C_par);
+        
+        //calcular speedup
+        double speedup = sequential_time / parallel_time;
+        
+        printf("%d\t%.6f\t%.6f\t%.2f\t%.2e\n", 
+               num_threads, sequential_time, parallel_time, 
+               speedup, precision);
+        
+        //liberar memória
+        for (int i = 0; i < N; i++) {
+            free(C_seq[i]);
+            free(C_new_seq[i]);
+            free(C_par[i]);
+            free(C_new_par[i]);
+        }
+        free(C_seq);
+        free(C_new_seq);
+        free(C_par);
+        free(C_new_par);
+    }
+    
+    return 0;
+}
