@@ -1,0 +1,284 @@
+%%writefile diffusion_mpi_hybrid.cu
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <cuda_runtime.h>
+#include <mpi.h>
+#include <omp.h>
+
+#define N 1000  // Grid size
+#define T 500   // Number of timesteps
+#define D 0.1   // Diffusion coefficient
+#define DELTA_T 0.01
+#define DELTA_X 1.0
+#define BLOCK_SIZE 32  // Increased from 16 to 32 for better GPU utilization
+#define PRINT_INTERVAL 100
+
+// CUDA error checking macro
+#define CHECK_CUDA_ERROR(call) { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error in %s:%d: %s\n", __FILE__, __LINE__, \
+                cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+__global__ void diff_eq_kernel(double *C, double *C_new, int rows, int cols) {
+    __shared__ double shared_block[BLOCK_SIZE + 2][BLOCK_SIZE + 2];
+
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int tx = threadIdx.x + 1;
+    int ty = threadIdx.y + 1;
+
+    // Load data into shared memory
+    if (i < rows && j < cols) {
+        shared_block[ty][tx] = C[i * cols + j];
+
+        // Load halo regions
+        if (threadIdx.x == 0 && j > 0)
+            shared_block[ty][0] = C[i * cols + (j-1)];
+        if (threadIdx.x == BLOCK_SIZE-1 && j < cols-1)
+            shared_block[ty][tx+1] = C[i * cols + (j+1)];
+        if (threadIdx.y == 0 && i > 0)
+            shared_block[0][tx] = C[(i-1) * cols + j];
+        if (threadIdx.y == BLOCK_SIZE-1 && i < rows-1)
+            shared_block[ty+1][tx] = C[(i+1) * cols + j];
+    }
+
+    __syncthreads();
+
+    if (i > 0 && i < rows-1 && j > 0 && j < cols-1) {
+        double laplacian = (shared_block[ty-1][tx] + shared_block[ty+1][tx] +
+                          shared_block[ty][tx-1] + shared_block[ty][tx+1] -
+                          4.0 * shared_block[ty][tx]) / (DELTA_X * DELTA_X);
+        C_new[i * cols + j] = shared_block[ty][tx] + D * DELTA_T * laplacian;
+    } else if (i < rows && j < cols) {
+        C_new[i * cols + j] = C[i * cols + j];  // Preserve boundary values
+    }
+}
+
+void print_region_stats(double *local_C, int local_rows, int local_cols, int rank, int t) {
+    double min_val = local_C[0];
+    double max_val = local_C[0];
+    double sum = 0.0;
+
+    #pragma omp parallel for collapse(2) reduction(min:min_val) reduction(max:max_val) reduction(+:sum)
+    for (int i = 0; i < local_rows; i++) {
+        for (int j = 0; j < local_cols; j++) {
+            double val = local_C[i * local_cols + j];
+            min_val = fmin(min_val, val);
+            max_val = fmax(max_val, val);
+            sum += val;
+        }
+    }
+    double avg_val = sum / (local_rows * local_cols);
+
+    printf("Step %d - Process %d stats - Min: %.4f, Max: %.4f, Avg: %.4f\n",
+           t, rank, min_val, max_val, avg_val);
+}
+
+void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, int local_cols,
+                       int total_rows, int total_cols, int rank, int num_procs, double *time) {
+    double start_time = MPI_Wtime();
+    double compute_time = 0.0;
+    double communication_time = 0.0;
+    int boundary_exchanges = 0;
+
+    // Allocate GPU memory and create streams
+    double *d_local_C, *d_local_C_new;
+    size_t local_size = local_rows * local_cols * sizeof(double);
+    cudaStream_t compute_stream, comm_stream;
+
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_local_C, local_size));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_local_C_new, local_size));
+    CHECK_CUDA_ERROR(cudaStreamCreate(&compute_stream));
+    CHECK_CUDA_ERROR(cudaStreamCreate(&comm_stream));
+
+    // Initial data transfer to GPU
+    CHECK_CUDA_ERROR(cudaMemcpyAsync(d_local_C, local_C, local_size,
+                                   cudaMemcpyHostToDevice, compute_stream));
+
+    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridDim((local_cols + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                 (local_rows + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    // Allocate buffers for non-blocking communication
+    double *send_top = NULL, *send_bottom = NULL;
+    double *recv_top = NULL, *recv_bottom = NULL;
+    if (rank > 0) {
+        send_top = (double*)malloc(local_cols * sizeof(double));
+        recv_top = (double*)malloc(local_cols * sizeof(double));
+    }
+    if (rank < num_procs - 1) {
+        send_bottom = (double*)malloc(local_cols * sizeof(double));
+        recv_bottom = (double*)malloc(local_cols * sizeof(double));
+    }
+
+    for (int t = 0; t < T; t++) {
+        double exchange_start = MPI_Wtime();
+        MPI_Request requests[4];
+        int req_count = 0;
+
+        // Copy boundary data for communication
+        if (rank > 0) {
+            CHECK_CUDA_ERROR(cudaMemcpyAsync(send_top, d_local_C + local_cols,
+                                           local_cols * sizeof(double),
+                                           cudaMemcpyDeviceToHost, comm_stream));
+        }
+        if (rank < num_procs - 1) {
+            CHECK_CUDA_ERROR(cudaMemcpyAsync(send_bottom,
+                                           d_local_C + (local_rows-2)*local_cols,
+                                           local_cols * sizeof(double),
+                                           cudaMemcpyDeviceToHost, comm_stream));
+        }
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(comm_stream));
+
+        // Non-blocking communication
+        if (rank > 0) {
+            MPI_Isend(send_top, local_cols, MPI_DOUBLE, rank-1, 0,
+                     MPI_COMM_WORLD, &requests[req_count++]);
+            MPI_Irecv(recv_top, local_cols, MPI_DOUBLE, rank-1, 0,
+                     MPI_COMM_WORLD, &requests[req_count++]);
+            boundary_exchanges++;
+        }
+        if (rank < num_procs - 1) {
+            MPI_Isend(send_bottom, local_cols, MPI_DOUBLE, rank+1, 0,
+                     MPI_COMM_WORLD, &requests[req_count++]);
+            MPI_Irecv(recv_bottom, local_cols, MPI_DOUBLE, rank+1, 0,
+                     MPI_COMM_WORLD, &requests[req_count++]);
+            boundary_exchanges++;
+        }
+
+        // Interior computation while communication is in progress
+        double compute_start = MPI_Wtime();
+        diff_eq_kernel<<<gridDim, blockDim, 0, compute_stream>>>(d_local_C, d_local_C_new,
+                                                                local_rows, local_cols);
+
+        // Wait for communication to complete
+        MPI_Waitall(req_count, requests, MPI_STATUSES_IGNORE);
+        communication_time += MPI_Wtime() - exchange_start;
+
+        // Update boundaries on GPU
+        if (rank > 0) {
+            CHECK_CUDA_ERROR(cudaMemcpyAsync(d_local_C, recv_top,
+                                           local_cols * sizeof(double),
+                                           cudaMemcpyHostToDevice, comm_stream));
+        }
+        if (rank < num_procs - 1) {
+            CHECK_CUDA_ERROR(cudaMemcpyAsync(d_local_C + (local_rows-1)*local_cols,
+                                           recv_bottom, local_cols * sizeof(double),
+                                           cudaMemcpyHostToDevice, comm_stream));
+        }
+
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(compute_stream));
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(comm_stream));
+        compute_time += MPI_Wtime() - compute_start;
+
+        // Swap pointers
+        double *temp = d_local_C;
+        d_local_C = d_local_C_new;
+        d_local_C_new = temp;
+
+        if (t % PRINT_INTERVAL == 0) {
+            CHECK_CUDA_ERROR(cudaMemcpy(local_C, d_local_C, local_size,
+                                      cudaMemcpyDeviceToHost));
+            print_region_stats(local_C, local_rows, local_cols, rank, t);
+        }
+    }
+
+    // Cleanup
+    CHECK_CUDA_ERROR(cudaMemcpy(local_C, d_local_C, local_size, cudaMemcpyDeviceToHost));
+    CHECK_CUDA_ERROR(cudaFree(d_local_C));
+    CHECK_CUDA_ERROR(cudaFree(d_local_C_new));
+    CHECK_CUDA_ERROR(cudaStreamDestroy(compute_stream));
+    CHECK_CUDA_ERROR(cudaStreamDestroy(comm_stream));
+
+    if (send_top) free(send_top);
+    if (send_bottom) free(send_bottom);
+    if (recv_top) free(recv_top);
+    if (recv_bottom) free(recv_bottom);
+
+    double end_time = MPI_Wtime();
+    *time = (end_time - start_time) * 1000;
+
+    printf("\nProcess %d Performance Metrics:\n", rank);
+    printf("  Total Time: %.2f ms\n", *time);
+    printf("  Computation Time: %.2f ms (%.1f%%)\n",
+           compute_time * 1000, (compute_time * 1000 / *time) * 100);
+    printf("  Communication Time: %.2f ms (%.1f%%)\n",
+           communication_time * 1000, (communication_time * 1000 / *time) * 100);
+    printf("  Number of Boundary Exchanges: %d\n", boundary_exchanges);
+    printf("  Average Time per Iteration: %.2f ms\n", *time / T);
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int num_procs, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    if (rank == 0) {
+        printf("\nSimulation Parameters:\n");
+        printf("Grid Size: %d x %d\n", N, N);
+        printf("Number of Timesteps: %d\n", T);
+        printf("Number of MPI Processes: %d\n", num_procs);
+        printf("CUDA Block Size: %d x %d\n", BLOCK_SIZE, BLOCK_SIZE);
+        printf("\n");
+    }
+
+    int total_rows = N;
+    int total_cols = N;
+    int local_rows = total_rows / num_procs;
+    if (rank < total_rows % num_procs) {
+        local_rows++;  // Distribute remaining rows
+    }
+    int local_cols = total_cols;
+
+    double *local_C = (double *)malloc(local_rows * local_cols * sizeof(double));
+    double *local_C_new = (double *)malloc(local_rows * local_cols * sizeof(double));
+
+    // Calculate global row offset for this process
+    int local_start_row = 0;
+    for (int i = 0; i < rank; i++) {
+        local_start_row += total_rows / num_procs;
+        if (i < total_rows % num_procs) {
+            local_start_row++;
+        }
+    }
+
+    // Initialize with central contamination source
+    #pragma omp parallel for collapse(2)
+    for (int i = 0; i < local_rows; i++) {
+        for (int j = 0; j < local_cols; j++) {
+            int global_row = local_start_row + i;
+            if (abs(global_row - N/2) <= N/8 && abs(j - N/2) <= N/8) {
+                local_C[i * local_cols + j] = 100.0;
+            } else {
+                local_C[i * local_cols + j] = 0.0;
+            }
+            local_C_new[i * local_cols + j] = 0.0;
+        }
+    }
+
+    // Synchronize after initialization
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    double time;
+    diff_eq_mpi_hybrid(local_C, local_C_new, local_rows, local_cols,
+                      total_rows, total_cols, rank, num_procs, &time);
+
+    if (rank == 0) {
+        printf("\nSimulation completed successfully!\n");
+        printf("Total execution time: %.2f ms\n", time);
+        printf("Grid points processed per second: %.2f million\n",
+               (N * N * T) / (time / 1000.0) / 1e6);
+    }
+
+    free(local_C);
+    free(local_C_new);
+    MPI_Finalize();
+    return 0;
+}
