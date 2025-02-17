@@ -6,12 +6,12 @@
 #include <mpi.h>
 #include <omp.h>
 
-#define N 1000  // Grid size
-#define T 500   // Number of timesteps
-#define D 0.1   // Diffusion coefficient
+#define N 1000 
+#define T 500  
+#define D 0.1   
 #define DELTA_T 0.01
 #define DELTA_X 1.0
-#define BLOCK_SIZE 32  // Increased from 16 to 32 for better GPU utilization
+#define BLOCK_SIZE 32  
 #define PRINT_INTERVAL 100
 
 // CUDA error checking macro
@@ -32,7 +32,6 @@ __global__ void diff_eq_kernel(double *C, double *C_new, int rows, int cols) {
     int tx = threadIdx.x + 1;
     int ty = threadIdx.y + 1;
 
-    // Load data into shared memory
     if (i < rows && j < cols) {
         shared_block[ty][tx] = C[i * cols + j];
 
@@ -86,7 +85,6 @@ void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, in
     double communication_time = 0.0;
     int boundary_exchanges = 0;
 
-    // Allocate GPU memory and create streams
     double *d_local_C, *d_local_C_new;
     size_t local_size = local_rows * local_cols * sizeof(double);
     cudaStream_t compute_stream, comm_stream;
@@ -96,7 +94,6 @@ void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, in
     CHECK_CUDA_ERROR(cudaStreamCreate(&compute_stream));
     CHECK_CUDA_ERROR(cudaStreamCreate(&comm_stream));
 
-    // Initial data transfer to GPU
     CHECK_CUDA_ERROR(cudaMemcpyAsync(d_local_C, local_C, local_size,
                                    cudaMemcpyHostToDevice, compute_stream));
 
@@ -104,7 +101,6 @@ void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, in
     dim3 gridDim((local_cols + BLOCK_SIZE - 1) / BLOCK_SIZE,
                  (local_rows + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    // Allocate buffers for non-blocking communication
     double *send_top = NULL, *send_bottom = NULL;
     double *recv_top = NULL, *recv_bottom = NULL;
     if (rank > 0) {
@@ -121,7 +117,6 @@ void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, in
         MPI_Request requests[4];
         int req_count = 0;
 
-        // Copy boundary data for communication
         if (rank > 0) {
             CHECK_CUDA_ERROR(cudaMemcpyAsync(send_top, d_local_C + local_cols,
                                            local_cols * sizeof(double),
@@ -135,7 +130,6 @@ void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, in
         }
         CHECK_CUDA_ERROR(cudaStreamSynchronize(comm_stream));
 
-        // Non-blocking communication
         if (rank > 0) {
             MPI_Isend(send_top, local_cols, MPI_DOUBLE, rank-1, 0,
                      MPI_COMM_WORLD, &requests[req_count++]);
@@ -151,16 +145,13 @@ void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, in
             boundary_exchanges++;
         }
 
-        // Interior computation while communication is in progress
         double compute_start = MPI_Wtime();
         diff_eq_kernel<<<gridDim, blockDim, 0, compute_stream>>>(d_local_C, d_local_C_new,
                                                                 local_rows, local_cols);
 
-        // Wait for communication to complete
         MPI_Waitall(req_count, requests, MPI_STATUSES_IGNORE);
         communication_time += MPI_Wtime() - exchange_start;
 
-        // Update boundaries on GPU
         if (rank > 0) {
             CHECK_CUDA_ERROR(cudaMemcpyAsync(d_local_C, recv_top,
                                            local_cols * sizeof(double),
@@ -176,7 +167,6 @@ void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, in
         CHECK_CUDA_ERROR(cudaStreamSynchronize(comm_stream));
         compute_time += MPI_Wtime() - compute_start;
 
-        // Swap pointers
         double *temp = d_local_C;
         d_local_C = d_local_C_new;
         d_local_C_new = temp;
@@ -188,7 +178,6 @@ void diff_eq_mpi_hybrid(double *local_C, double *local_C_new, int local_rows, in
         }
     }
 
-    // Cleanup
     CHECK_CUDA_ERROR(cudaMemcpy(local_C, d_local_C, local_size, cudaMemcpyDeviceToHost));
     CHECK_CUDA_ERROR(cudaFree(d_local_C));
     CHECK_CUDA_ERROR(cudaFree(d_local_C_new));
@@ -240,7 +229,6 @@ int main(int argc, char** argv) {
     double *local_C = (double *)malloc(local_rows * local_cols * sizeof(double));
     double *local_C_new = (double *)malloc(local_rows * local_cols * sizeof(double));
 
-    // Calculate global row offset for this process
     int local_start_row = 0;
     for (int i = 0; i < rank; i++) {
         local_start_row += total_rows / num_procs;
@@ -249,7 +237,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Initialize with central contamination source
     #pragma omp parallel for collapse(2)
     for (int i = 0; i < local_rows; i++) {
         for (int j = 0; j < local_cols; j++) {
@@ -263,7 +250,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Synchronize after initialization
     MPI_Barrier(MPI_COMM_WORLD);
 
     double time;
